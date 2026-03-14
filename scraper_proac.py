@@ -21,7 +21,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SITE_URL  = "https://vitrinedeprojetos.cultura.sp.gov.br"
 BASE_URL  = f"{SITE_URL}/projetos"
 PAGE_SIZE = 9
-DELAY     = 1.0
+DELAY     = 0.5   # delay entre requests de detalhe
+DELAY_PAGE = 1.0  # delay entre páginas
 
 NEXT_ACTION = "409f7e88cc74a85f1b7fec4bf1de1ea6fd100abd76"
 STATE_TREE  = "%5B%22%22%2C%7B%22children%22%3A%5B%22(public)%22%2C%7B%22children%22%3A%5B%22projetos%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fprojetos%3Fpage%3D1%26filterType%3Dcaptando%26sortOption%3DpublicationAsc%22%2C%22refresh%22%5D%7D%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
@@ -44,6 +45,14 @@ def strip_html(html: str) -> str:
     s = MLStripper()
     s.feed(html)
     return s.get_data()
+
+def fix_encoding(text: str) -> str:
+    if not text:
+        return text
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except:
+        return text
 
 # ─── RSC parser ────────────────────────────────────────────────────────────────
 
@@ -69,6 +78,28 @@ def extract_json_from_rsc(text: str) -> dict | None:
                         return json.loads(sub[:i+1])
                     except json.JSONDecodeError:
                         break
+    return None
+
+# ─── Fetch proponente real ──────────────────────────────────────────────────────
+
+def fetch_proponente(mongo_id: str) -> str | None:
+    """Busca o nome real do proponente na página de detalhes do projeto."""
+    try:
+        resp = requests.get(
+            f"{SITE_URL}/projetos/{mongo_id}/detalhes",
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-BR,pt;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
+            },
+            timeout=20,
+        )
+        text = resp.content.decode("utf-8", errors="replace")
+        match = re.search(r'Proponente:</p><p class="text-lg font-medium">([^<]+)</p>', text)
+        if match:
+            return fix_encoding(match.group(1).strip())
+    except requests.RequestException:
+        pass
     return None
 
 # ─── Fetch page ────────────────────────────────────────────────────────────────
@@ -99,7 +130,6 @@ def fetch_page(page: int, filter_type: str = "captando") -> dict | None:
             timeout=30,
         )
         resp.raise_for_status()
-        # Força decode correto dos bytes brutos
         text = resp.content.decode("utf-8", errors="replace")
         result = extract_json_from_rsc(text)
         if not result:
@@ -110,14 +140,6 @@ def fetch_page(page: int, filter_type: str = "captando") -> dict | None:
         return None
 
 # ─── Parse project ─────────────────────────────────────────────────────────────
-
-def fix_encoding(text: str) -> str:
-    if not text:
-        return text
-    try:
-        return text.encode("latin-1").decode("utf-8")
-    except:
-        return text
 
 def parse_project(p: dict) -> dict:
     pub_date = p.get("publishDateOfficialDiary", "")
@@ -132,10 +154,19 @@ def parse_project(p: dict) -> dict:
     if summary.startswith("$"):
         summary = ""
 
+    # Busca o nome real do proponente
+    mongo_id = p.get("id", "")
+    proponente = fetch_proponente(mongo_id) if mongo_id else None
+    if not proponente:
+        # Fallback: traduz o tipo
+        tipo = p.get("personType", "")
+        proponente = "Pessoa Jurídica" if tipo == "LegalPerson" else "Pessoa Física"
+    time.sleep(DELAY)
+
     return {
         "id":              p.get("submissionNumber", ""),
         "nome":            fix_encoding(p.get("projectName", "")),
-        "proponente":      p.get("personType", ""),
+        "proponente":      proponente,
         "area":            fix_encoding(p.get("segment", "")),
         "cidade":          fix_encoding(p.get("executionCities", "")),
         "ano":             ano,
@@ -143,7 +174,7 @@ def parse_project(p: dict) -> dict:
         "captado":         p.get("capturedValue"),
         "status":          "captando",
         "descricao":       fix_encoding(strip_html(summary)),
-        "numero_processo": p.get("id", ""),
+        "numero_processo": mongo_id,
         "edital":          None,
     }
 
@@ -185,22 +216,22 @@ def run(filter_type: str = "captando"):
     all_projects = []
 
     for page in range(1, total_pages + 1):
-        print(f"  📥 Página {page}/{total_pages}...", end=" ", flush=True)
+        print(f"  📥 Página {page}/{total_pages}...", flush=True)
 
         page_data = data if page == 1 else fetch_page(page, filter_type)
 
         if page > 1:
-            time.sleep(DELAY)
+            time.sleep(DELAY_PAGE)
 
         if not page_data:
-            print("⚠️  pulada")
+            print("  ⚠️  pulada")
             continue
 
         rows = [parse_project(p) for p in page_data.get("projects", [])]
         all_projects.extend(rows)
 
         ok = upsert_batch(rows, filter_type)
-        print(f"✅ {len(rows)} projetos" if ok else "❌ falha no upsert")
+        print(f"  ✅ {len(rows)} projetos salvos" if ok else "  ❌ falha no upsert")
 
     print(f"\n🎉 Concluído! Total processado: {len(all_projects)} projetos")
 

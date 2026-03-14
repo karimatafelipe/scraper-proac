@@ -48,11 +48,6 @@ def strip_html(html: str) -> str:
 # ─── RSC parser ────────────────────────────────────────────────────────────────
 
 def extract_json_from_rsc(text: str) -> dict | None:
-    """
-    Extrai o JSON de projetos da resposta RSC do Next.js.
-    O JSON fica embutido na linha longa da resposta no formato:
-    {"projects":[...],"totalPages":N}
-    """
     matches = re.findall(r'\{"projects":\[.*\],"totalPages":\d+\}', text)
     if matches:
         try:
@@ -60,12 +55,9 @@ def extract_json_from_rsc(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: busca por posição
     idx = text.find('{"projects":[')
     if idx >= 0:
-        # Tenta parsear a partir dali
         sub = text[idx:]
-        # Encontra o fechamento correto do JSON
         depth = 0
         for i, ch in enumerate(sub):
             if ch == '{':
@@ -106,11 +98,12 @@ def fetch_page(page: int, filter_type: str = "captando") -> dict | None:
             data=body.encode("utf-8"),
             timeout=30,
         )
-        resp.encoding = 'utf-8'
         resp.raise_for_status()
-        result = extract_json_from_rsc(resp.text)
+        # Força decode correto dos bytes brutos
+        text = resp.content.decode("utf-8", errors="replace")
+        result = extract_json_from_rsc(text)
         if not result:
-            print(f"\n  ⚠️  Não encontrou JSON na p{page}. Preview: {resp.text[:150]}")
+            print(f"\n  ⚠️  Não encontrou JSON na p{page}. Preview: {text[:150]}")
         return result
     except requests.RequestException as e:
         print(f"  ⚠️  Erro na página {page}: {e}")
@@ -157,7 +150,6 @@ def parse_project(p: dict) -> dict:
 # ─── Supabase upsert ───────────────────────────────────────────────────────────
 
 def upsert_batch(rows: list, filter_type: str) -> bool:
-    # Injeta o filter_type como status
     for r in rows:
         r["status"] = filter_type
 

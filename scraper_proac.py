@@ -118,6 +118,14 @@ def fetch_page(page: int, filter_type: str = "captando") -> dict | None:
 
 # ─── Parse project ─────────────────────────────────────────────────────────────
 
+def fix_encoding(text: str) -> str:
+    if not text:
+        return text
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except:
+        return text
+
 def parse_project(p: dict) -> dict:
     pub_date = p.get("publishDateOfficialDiary", "")
     ano = None
@@ -127,22 +135,21 @@ def parse_project(p: dict) -> dict:
         except ValueError:
             pass
 
-    # summary pode ser "$2", "$3" etc (referência RSC) — ignora nesses casos
     summary = p.get("summary", "")
     if summary.startswith("$"):
         summary = ""
 
     return {
         "id":              p.get("submissionNumber", ""),
-        "nome":            p.get("projectName", ""),
+        "nome":            fix_encoding(p.get("projectName", "")),
         "proponente":      p.get("personType", ""),
-        "area":            p.get("segment", ""),
-        "cidade":          p.get("executionCities", ""),
+        "area":            fix_encoding(p.get("segment", "")),
+        "cidade":          fix_encoding(p.get("executionCities", "")),
         "ano":             ano,
         "valor":           p.get("approvedProacValue"),
         "captado":         p.get("capturedValue"),
         "status":          "captando",
-        "descricao":       strip_html(summary),
+        "descricao":       fix_encoding(strip_html(summary)),
         "numero_processo": p.get("id", ""),
         "edital":          None,
     }
@@ -207,5 +214,5 @@ def run(filter_type: str = "captando"):
 
 
 if __name__ == "__main__":
+    run(filter_type="captando")
     run(filter_type="todos")
-    # run(filter_type="todos")  # descomente para pegar todos os status

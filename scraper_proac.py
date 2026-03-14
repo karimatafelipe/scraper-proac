@@ -207,5 +207,5 @@ def run(filter_type: str = "captando"):
 
 
 if __name__ == "__main__":
-    run(filter_type="captando")
+    run(filter_type="todos")
     # run(filter_type="todos")  # descomente para pegar todos os status

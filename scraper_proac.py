@@ -106,6 +106,7 @@ def fetch_page(page: int, filter_type: str = "captando") -> dict | None:
             data=body.encode("utf-8"),
             timeout=30,
         )
+        resp.encoding = 'utf-8'
         resp.raise_for_status()
         result = extract_json_from_rsc(resp.text)
         if not result:

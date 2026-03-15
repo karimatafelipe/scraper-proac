@@ -1,5 +1,6 @@
 """
 Scraper - LPIE (Lei Paulista de Incentivo ao Esporte) → Supabase
+Extrai dados dos PDFs oficiais de projetos aprovados
 Autor: gerado para Felipe
 Uso: python3 scraper_lpie.py
 """
@@ -8,7 +9,7 @@ import os
 import re
 import time
 import requests
-from html.parser import HTMLParser
+import fitz  # pymupdf
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,155 +18,173 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-BASE_URL  = "http://www.lpie.sp.gov.br/ConsultaPublica/Lista"
-DELAY     = 0.3
+BASE_DOC_URL = "http://www.lpie.sp.gov.br/DocumentosCadastro/Buscar"
 
-# ─── HTML helpers ──────────────────────────────────────────────────────────────
+# PDFs conhecidos por ano — o script tenta descobrir novos automaticamente
+PDFS_CONHECIDOS = {
+    2024: 353934,
+}
 
-class MLStripper(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.reset()
-        self.fed = []
-    def handle_data(self, d):
-        self.fed.append(d)
-    def get_data(self):
-        return " ".join(self.fed).strip()
+# Range de IDs para buscar PDFs novos (varre em torno dos conhecidos)
+BUSCA_RANGE = 500
 
-def strip_html(html: str) -> str:
-    if not html:
-        return ""
-    s = MLStripper()
-    s.feed(html)
-    return s.get_data()
+# ─── Descoberta automática de novos PDFs ───────────────────────────────────────
 
-def fix_encoding(text: str) -> str:
-    if not text:
-        return text
-    try:
-        return text.encode("latin-1").decode("utf-8")
-    except:
-        return text
+def descobrir_novos_pdfs(ultimo_id_conhecido: int) -> dict[int, int]:
+    """
+    Tenta encontrar PDFs de anos mais recentes varrendo IDs acima do último conhecido.
+    Retorna {ano: id_pdf} para os novos encontrados.
+    """
+    print(f"🔍 Buscando novos PDFs de projetos aprovados (IDs {ultimo_id_conhecido+1} a {ultimo_id_conhecido+BUSCA_RANGE})...")
+    novos = {}
 
-# ─── Fetch lista ───────────────────────────────────────────────────────────────
+    for doc_id in range(ultimo_id_conhecido + 1, ultimo_id_conhecido + BUSCA_RANGE):
+        try:
+            resp = requests.get(
+                f"{BASE_DOC_URL}/{doc_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            if resp.status_code == 200 and resp.content[:4] == b'%PDF':
+                # Verifica se é um PDF da LPIE de projetos aprovados
+                doc = fitz.open(stream=resp.content, filetype="pdf")
+                texto_p1 = doc[0].get_text()[:500]
+                if "LEI PAULISTA DE INCENTIVO AO ESPORTE" in texto_p1 and "Projetos Aprovados" in texto_p1:
+                    # Extrai o ano do título
+                    ano_match = re.search(r'em (\d{4})', texto_p1)
+                    if ano_match:
+                        ano = int(ano_match.group(1))
+                        novos[ano] = doc_id
+                        print(f"  ✅ Novo PDF encontrado! Ano: {ano}, ID: {doc_id}")
+                doc.close()
+        except Exception:
+            continue
+        time.sleep(0.2)
 
-def fetch_lista(ano_inicio: int = 2024) -> str | None:
-    """Busca a página HTML com a lista de projetos."""
+    if not novos:
+        print("  ℹ️  Nenhum PDF novo encontrado.")
+    return novos
+
+# ─── Download e parse do PDF ───────────────────────────────────────────────────
+
+def download_pdf(doc_id: int) -> bytes | None:
     try:
         resp = requests.get(
-            BASE_URL,
-            params={
-                "DataCadastroInicio": f"01/01/{ano_inicio} 00:00:00",
-                "DataCadastroFim":    "31/12/2099 00:00:00",
-                "CodigoSegmentoCultural": "0",
-                "CodigoProjeto": "0",
-                "LocalProponente": "0",
-                "LocalRealizacao": "0",
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "pt-BR,pt;q=0.9",
-            },
+            f"{BASE_DOC_URL}/{doc_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.content.decode("utf-8", errors="replace")
+        return resp.content
     except requests.RequestException as e:
-        print(f"❌ Erro ao buscar lista: {e}")
+        print(f"❌ Erro ao baixar PDF {doc_id}: {e}")
         return None
 
-# ─── Parse tabela ──────────────────────────────────────────────────────────────
+def parse_valor(texto: str) -> float | None:
+    """Converte 'R$ 1.234,56' para float."""
+    if not texto:
+        return None
+    texto = texto.replace("R$", "").strip()
+    texto = texto.replace(".", "").replace(",", ".")
+    try:
+        return float(texto)
+    except ValueError:
+        return None
 
-def parse_tabela(html: str) -> list[dict]:
-    """Extrai os projetos da tabela HTML."""
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+def parse_percentual(texto: str) -> float | None:
+    """Converte '38,46%' para float."""
+    if not texto:
+        return None
+    texto = texto.replace("%", "").replace(",", ".").strip()
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+def parse_pdf(pdf_bytes: bytes, ano: int) -> list[dict]:
+    """Extrai projetos do PDF da LPIE."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     projetos = []
 
-    for row in rows:
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-        if len(cells) < 5:
+    # Concatena todo o texto do PDF
+    texto_completo = ""
+    for page in doc:
+        texto_completo += page.get_text() + "\n"
+    doc.close()
+
+    # Padrão de cada projeto:
+    # CÓDIGO_LPIE\nCÓDIGO_SEFAZ\nNOME PROPONENTE\nNOME PROJETO\nR$ VALOR_APROV\nR$ VALOR_CAPT\nPERCENT% CNPJ\nÁREA\nMUNICÍPIOS\nPÚBLICO\nMODALIDADE
+    # Usa o código LPIE (4 dígitos) como âncora
+    blocos = re.split(r'\n(?=\d{4}\n\d{6}\n)', texto_completo)
+
+    for bloco in blocos:
+        linhas = [l.strip() for l in bloco.strip().split('\n') if l.strip()]
+        if len(linhas) < 6:
             continue
 
-        # Extrai o IdProjeto do link
-        id_match = re.search(r'IdProjeto=(\d+)', row)
-        if not id_match:
+        # Verifica se começa com código LPIE (4 dígitos) e SEFAZ (6 dígitos)
+        if not re.match(r'^\d{4}$', linhas[0]):
             continue
-        projeto_id = id_match.group(1)
+        if not re.match(r'^\d{6}$', linhas[1]):
+            continue
 
-        data_cadastro  = strip_html(cells[0]).strip()
-        nome           = fix_encoding(strip_html(cells[1]).strip())
-        proponente     = fix_encoding(strip_html(cells[2]).strip())
-        segmento       = fix_encoding(strip_html(cells[3]).strip())
-        status         = fix_encoding(strip_html(cells[4]).strip())
+        codigo_lpie  = linhas[0]
+        codigo_sefaz = linhas[1]
+
+        # Proponente e nome do projeto ficam antes do valor
+        # Procura a linha com R$
+        idx_valor = None
+        for i, l in enumerate(linhas):
+            if re.match(r'^R\$', l):
+                idx_valor = i
+                break
+
+        if idx_valor is None or idx_valor < 3:
+            continue
+
+        proponente = " ".join(linhas[2:idx_valor-1])
+        nome_projeto = linhas[idx_valor-1]
+
+        valor_aprovado = parse_valor(linhas[idx_valor]) if idx_valor < len(linhas) else None
+        valor_captado  = parse_valor(linhas[idx_valor+1]) if idx_valor+1 < len(linhas) else None
+
+        # Percentual e CNPJ ficam na mesma linha: "38,46% 09.093.751/0001-74"
+        perc_cnpj_line = linhas[idx_valor+2] if idx_valor+2 < len(linhas) else ""
+        perc_match  = re.match(r'^([\d,\.]+)%\s*([\d\.\/\-]+)', perc_cnpj_line)
+        percentual  = parse_percentual(perc_match.group(1)) if perc_match else None
+        cnpj        = perc_match.group(2).strip() if perc_match else None
+
+        area        = linhas[idx_valor+3] if idx_valor+3 < len(linhas) else None
+        municipios  = linhas[idx_valor+4] if idx_valor+4 < len(linhas) else None
+
+        # Modalidade é a última linha do bloco
+        modalidade  = linhas[-1] if linhas else None
+
+        # Público alvo é tudo entre municípios e modalidade
+        publico_alvo = " ".join(linhas[idx_valor+5:-1]) if idx_valor+5 < len(linhas)-1 else None
 
         projetos.append({
-            "id":               projeto_id,
-            "nome":             nome,
-            "proponente":       proponente,
-            "segmento":         segmento,
-            "status":           status,
-            "data_cadastro":    data_cadastro,
-            "local_proponente": None,
-            "local_realizacao": None,
-            "valor":            None,
-            "descricao":        None,
+            "id":                 codigo_lpie,
+            "nome":               nome_projeto,
+            "proponente":         proponente,
+            "segmento":           area,
+            "status":             "aprovado",
+            "data_cadastro":      None,
+            "local_proponente":   None,
+            "local_realizacao":   municipios,
+            "valor":              valor_aprovado,
+            "descricao":          None,
+            "codigo_sefaz":       codigo_sefaz,
+            "cnpj":               cnpj,
+            "area_atuacao":       area,
+            "modalidade":         modalidade,
+            "percentual_captado": percentual,
+            "valor_captado":      valor_captado,
+            "publico_alvo":       publico_alvo,
+            "ano":                ano,
         })
 
     return projetos
-
-# ─── Fetch detalhes ────────────────────────────────────────────────────────────
-
-def fetch_detalhes(projeto_id: str) -> dict:
-    """Busca detalhes adicionais do projeto (valor, local, descrição)."""
-    try:
-        resp = requests.get(
-            "http://www.lpie.sp.gov.br/ConsultaPublicaImprimir/Create",
-            params={
-                "IdProjeto": projeto_id,
-                "IdUsuario": "0",
-                "IdConta": "0",
-                "CodigoEmp": "0",
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=20,
-        )
-        html = resp.content.decode("utf-8", errors="replace")
-
-        # Extrai valor aprovado
-        valor = None
-        valor_match = re.search(r'Valor[^<]*Aprovado[^<]*</[^>]+>\s*<[^>]+>\s*R\$\s*([\d\.,]+)', html, re.IGNORECASE)
-        if not valor_match:
-            valor_match = re.search(r'R\$\s*([\d\.,]+)', html)
-        if valor_match:
-            try:
-                valor_str = valor_match.group(1).replace(".", "").replace(",", ".")
-                valor = float(valor_str)
-            except:
-                pass
-
-        # Extrai local do proponente
-        local_prop = None
-        local_match = re.search(r'Munic[íi]pio[^<]*</[^>]+>\s*<[^>]+>\s*([^<]+)', html, re.IGNORECASE)
-        if local_match:
-            local_prop = fix_encoding(local_match.group(1).strip())
-
-        # Extrai descrição/objetivo
-        descricao = None
-        desc_match = re.search(r'Objetivo[^<]*</[^>]+>\s*<[^>]+>\s*([^<]+)', html, re.IGNORECASE)
-        if desc_match:
-            descricao = fix_encoding(desc_match.group(1).strip())
-
-        return {
-            "valor":            valor,
-            "local_proponente": local_prop,
-            "descricao":        descricao,
-        }
-    except requests.RequestException:
-        return {}
 
 # ─── Supabase upsert ───────────────────────────────────────────────────────────
 
@@ -188,31 +207,43 @@ def upsert_batch(rows: list) -> bool:
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
-def run(ano_inicio: int = 2024):
-    print(f"\n🚀 Iniciando scraping LPIE — a partir de {ano_inicio}")
+def run():
+    print("\n🚀 Iniciando scraper LPIE — PDFs de projetos aprovados")
 
-    html = fetch_lista(ano_inicio)
-    if not html:
-        print("❌ Falha ao buscar lista. Abortando.")
-        return
+    # Descobre novos PDFs automaticamente
+    ultimo_id = max(PDFS_CONHECIDOS.values())
+    novos = descobrir_novos_pdfs(ultimo_id)
+    todos_pdfs = {**PDFS_CONHECIDOS, **novos}
 
-    projetos = parse_tabela(html)
-    print(f"📋 Projetos encontrados: {len(projetos)}")
+    print(f"\n📋 PDFs a processar: {todos_pdfs}")
 
-    for i, p in enumerate(projetos, 1):
-        print(f"  📥 {i}/{len(projetos)} — {p['nome'][:50]}...", end=" ", flush=True)
+    total_geral = 0
 
-        # Busca detalhes
-        detalhes = fetch_detalhes(p["id"])
-        p.update(detalhes)
-        time.sleep(DELAY)
+    for ano, doc_id in sorted(todos_pdfs.items()):
+        print(f"\n📄 Processando PDF {ano} (ID: {doc_id})...")
 
-        # Upsert individual
-        ok = upsert_batch([p])
-        print(f"✅" if ok else "❌")
+        pdf_bytes = download_pdf(doc_id)
+        if not pdf_bytes:
+            continue
 
-    print(f"\n🎉 Concluído! Total processado: {len(projetos)} projetos LPIE")
+        projetos = parse_pdf(pdf_bytes, ano)
+        print(f"  📊 Projetos extraídos: {len(projetos)}")
+
+        if not projetos:
+            print("  ⚠️  Nenhum projeto extraído — verifique o formato do PDF")
+            continue
+
+        # Upsert em lotes de 50
+        lote_size = 50
+        for i in range(0, len(projetos), lote_size):
+            lote = projetos[i:i+lote_size]
+            ok = upsert_batch(lote)
+            print(f"  {'✅' if ok else '❌'} Lote {i//lote_size + 1}: {len(lote)} projetos")
+
+        total_geral += len(projetos)
+
+    print(f"\n🎉 Concluído! Total processado: {total_geral} projetos LPIE aprovados")
 
 
 if __name__ == "__main__":
-    run(ano_inicio=2024)
+    run()

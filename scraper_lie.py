@@ -26,7 +26,7 @@ PAGE_URL = "https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-
 # URL conhecida como fallback
 FALLBACK_URL = "https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-ao-esporte/projetos-aptos-a-captacao-atualizada-31-12-25.xlsx/@@download/file"
 
-APENAS_SP = True
+APENAS_SP = False
 
 # ─── Descoberta automática da URL mais recente ─────────────────────────────────
 

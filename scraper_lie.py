@@ -20,10 +20,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# URL base da página de projetos LIE
-PAGE_URL = "https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-ao-esporte"
-
-# URL conhecida como fallback
+PAGE_URL     = "https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-ao-esporte"
 FALLBACK_URL = "https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-ao-esporte/projetos-aptos-a-captacao-atualizada-31-12-25.xlsx/@@download/file"
 
 APENAS_SP = False
@@ -31,71 +28,40 @@ APENAS_SP = False
 # ─── Descoberta automática da URL mais recente ─────────────────────────────────
 
 def descobrir_url_xlsx() -> str:
-    """
-    Busca a URL mais recente do XLSX na página da LIE.
-    Procura por links com 'projetos-aptos' e extensão .xlsx
-    """
     print("🔍 Buscando URL mais recente do XLSX LIE...")
     try:
-        resp = requests.get(
-            PAGE_URL,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=30,
-        )
+        resp = requests.get(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         resp.raise_for_status()
 
-        # Procura links de xlsx com "projetos-aptos"
-        matches = re.findall(
+        for pattern in [
             r'href=["\']([^"\']*projetos-aptos[^"\']*\.xlsx[^"\']*)["\']',
-            resp.text,
-            re.IGNORECASE
-        )
-
-        if matches:
-            # Pega o mais recente (geralmente o primeiro ou último)
-            url = matches[0]
-            if not url.startswith("http"):
-                url = "https://www.gov.br" + url
-            # Adiciona @@download/file se necessário
-            if "@@download" not in url:
-                url = url + "/@@download/file"
-            print(f"  ✅ URL encontrada: {url}")
-            return url
-
-        # Tenta buscar também links com "captacao"
-        matches2 = re.findall(
             r'href=["\']([^"\']*captacao[^"\']*\.xlsx[^"\']*)["\']',
-            resp.text,
-            re.IGNORECASE
-        )
-        if matches2:
-            url = matches2[0]
-            if not url.startswith("http"):
-                url = "https://www.gov.br" + url
-            if "@@download" not in url:
-                url = url + "/@@download/file"
-            print(f"  ✅ URL encontrada: {url}")
-            return url
+        ]:
+            matches = re.findall(pattern, resp.text, re.IGNORECASE)
+            if matches:
+                url = matches[0]
+                if not url.startswith("http"):
+                    url = "https://www.gov.br" + url
+                if "@@download" not in url:
+                    url = url + "/@@download/file"
+                print(f"  ✅ URL encontrada: {url}")
+                return url
 
     except requests.RequestException as e:
         print(f"  ⚠️  Erro ao buscar página: {e}")
 
-    # Tenta variações de ano automaticamente
     ano_atual = datetime.today().year
-    anos_testar = [ano_atual, ano_atual - 1]
-    meses = ["12", "06", "03"]
-
-    for ano in anos_testar:
-        for mes in meses:
-            url_tentativa = (
+    for ano in [ano_atual, ano_atual - 1]:
+        for mes in ["12", "06", "03"]:
+            url_t = (
                 f"https://www.gov.br/esporte/pt-br/acoes-e-programas/lei-de-incentivo-ao-esporte/"
                 f"projetos-aptos-a-captacao-atualizada-{mes}-{str(ano)[2:]}.xlsx/@@download/file"
             )
             try:
-                r = requests.head(url_tentativa, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                r = requests.head(url_t, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                 if r.status_code == 200:
-                    print(f"  ✅ URL por variação de ano: {url_tentativa}")
-                    return url_tentativa
+                    print(f"  ✅ URL por variação de ano: {url_t}")
+                    return url_t
             except:
                 continue
 
@@ -105,18 +71,40 @@ def descobrir_url_xlsx() -> str:
 # ─── Download XLSX ─────────────────────────────────────────────────────────────
 
 def download_xlsx(url: str) -> bytes | None:
-    print(f"📥 Baixando planilha: {url.split('/')[-2]}...")
+    print(f"📥 Baixando planilha...")
     try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=60,
-        )
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
         resp.raise_for_status()
         print(f"  ✅ Baixado: {len(resp.content)//1024}KB")
         return resp.content
     except requests.RequestException as e:
         print(f"  ❌ Erro: {e}")
+        return None
+
+# ─── Parse valor ───────────────────────────────────────────────────────────────
+
+def parse_valor(v) -> float | None:
+    """
+    Converte o valor da célula para float com 2 casas decimais.
+    O openpyxl já retorna float quando a célula é numérica — usa direto.
+    Só faz conversão de string se necessário.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return round(float(v), 2)
+    # Se vier como string (raro), remove formatação BR
+    try:
+        s = str(v).strip().replace("R$", "").strip()
+        # Se tem vírgula e ponto: formato BR (1.234,56)
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        # Se tem só vírgula: formato BR sem milhar (1234,56)
+        elif "," in s:
+            s = s.replace(",", ".")
+        # Se tem só ponto: já é formato EN (1234.56) — usa direto
+        return round(float(s), 2)
+    except:
         return None
 
 # ─── Parse XLSX ────────────────────────────────────────────────────────────────
@@ -135,37 +123,44 @@ def parse_xlsx(xlsx_bytes: bytes) -> list[dict]:
 
         numero       = str(row[0]).strip() if row[0] else None
         processo     = str(row[1]).strip() if row[1] else None
-        proponente   = str(row[2]).strip() if row[2] else None
+        proponente   = str(row[2]).strip().replace("\xa0", "") if row[2] else None
         nome         = str(row[3]).strip() if row[3] else None
         manifestacao = str(row[6]).strip() if row[6] else None
         modalidade   = str(row[7]).strip() if row[7] else None
-        cnpj         = str(row[8]).strip() if row[8] else None
+        cnpj         = str(row[8]).strip().replace("\xa0", "") if row[8] else None
         cidade       = str(row[9]).strip() if row[9] else None
         uf           = str(row[10]).strip() if row[10] else None
 
         if APENAS_SP and uf != "SP":
             continue
 
-        valor = None
-        if row[11]:
-            try:
-                valor = float(str(row[11]).replace("R$", "").replace(".", "").replace(",", ".").strip())
-            except:
-                pass
+        # ✅ Usa parse_valor correto — não remove ponto de float!
+        valor = parse_valor(row[11])
 
-        data_pub = str(row[12]).strip() if row[12] else None
-        prazo    = str(row[13]).strip() if row[13] else None
+        # Datas — openpyxl retorna datetime direto
+        data_pub = None
+        if row[12]:
+            if isinstance(row[12], datetime):
+                data_pub = row[12].strftime("%d/%m/%Y")
+            else:
+                data_pub = str(row[12])[:10]
 
-        status = "encerrado"
-        if prazo:
-            for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y"]:
-                try:
-                    prazo_dt = datetime.strptime(prazo[:10], fmt)
-                    if prazo_dt >= hoje:
-                        status = "em_captacao"
-                    break
-                except:
-                    continue
+        prazo = None
+        prazo_dt = None
+        if row[13]:
+            if isinstance(row[13], datetime):
+                prazo_dt = row[13]
+                prazo = row[13].strftime("%d/%m/%Y")
+            else:
+                prazo = str(row[13])[:10]
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d"]:
+                    try:
+                        prazo_dt = datetime.strptime(prazo, fmt)
+                        break
+                    except:
+                        continue
+
+        status = "em_captacao" if prazo_dt and prazo_dt >= hoje else "encerrado"
 
         if not numero:
             continue
